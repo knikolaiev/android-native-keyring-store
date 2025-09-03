@@ -23,9 +23,10 @@ pub const MODE_PRIVATE: i32 = 0;
 pub const ENCRYPT_MODE: i32 = 1;
 pub const DECRYPT_MODE: i32 = 2;
 pub const CIPHER_TRANSFORMATION: &str = "AES/GCM/NoPadding";
+pub const IV_LEN: usize = 12;
 
 pub struct AndroidStore {
-    java_vm: JavaVM,
+    java_vm: Arc<JavaVM>,
     context: Context,
 }
 impl AndroidStore {
@@ -47,7 +48,7 @@ impl AndroidStore {
     }
 
     pub fn new(env: &JNIEnv, context: Context) -> AndroidKeyringResult<Arc<Self>> {
-        let java_vm = env.get_java_vm()?;
+        let java_vm = Arc::new(env.get_java_vm()?);
         Ok(Arc::new(Self { java_vm, context }))
     }
 }
@@ -70,8 +71,8 @@ impl CredentialStoreApi for AndroidStore {
         user: &str,
         _modifiers: Option<&HashMap<&str, &str>>,
     ) -> keyring_core::Result<Entry> {
-        let credential = self
-            .check_for_exception(|env| AndroidCredential::new(env, &self.context, service, user))?;
+        let credential =
+            AndroidCredential::new(self.java_vm.clone(), self.context.clone(), service, user);
 
         Ok(Entry::new_with_credential(Arc::new(credential)))
     }
@@ -82,37 +83,25 @@ impl CredentialStoreApi for AndroidStore {
 }
 
 pub struct AndroidCredential {
-    java_vm: JavaVM,
-    key: Key,
-    file: SharedPreferences,
+    java_vm: Arc<JavaVM>,
+    context: Context,
     service: String,
     user: String,
 }
 impl AndroidCredential {
-    pub fn new(
-        env: &mut JNIEnv,
-        context: &Context,
-        service: &str,
-        user: &str,
-    ) -> AndroidKeyringResult<Self> {
-        let java_vm = env.get_java_vm()?;
-        let key = {
-            static SERVICE_LOCK: Mutex<()> = Mutex::new(());
-            let _lock = SERVICE_LOCK.lock().unwrap();
-            Self::get_key(env, service)?
-        };
-        let file = Self::get_file(env, context, service)?;
-
-        Ok(Self {
+    pub fn new(java_vm: Arc<JavaVM>, context: Context, service: &str, user: &str) -> Self {
+        Self {
             java_vm,
-            key,
-            file,
+            context,
             service: service.to_owned(),
             user: user.to_owned(),
-        })
+        }
     }
 
     fn get_key(env: &mut JNIEnv, service: &str) -> AndroidKeyringResult<Key> {
+        static SERVICE_LOCK: Mutex<()> = Mutex::new(());
+        let _lock = SERVICE_LOCK.lock().unwrap();
+
         let keystore = KeyStore::get_instance(env, PROVIDER)?;
         keystore.load(env)?;
 
@@ -147,14 +136,22 @@ impl AndroidCredential {
 impl CredentialApi for AndroidCredential {
     fn set_secret(&self, secret: &[u8]) -> keyring_core::Result<()> {
         self.check_for_exception(|env| {
+            let file = Self::get_file(env, &self.context, &self.service)?;
+            let key = Self::get_key(env, &self.service)?;
+
             let cipher = Cipher::get_instance(env, CIPHER_TRANSFORMATION)?;
-            cipher.init(env, ENCRYPT_MODE, &self.key)?;
+            cipher.init(env, ENCRYPT_MODE, &key)?;
             let iv = cipher.get_iv(env)?;
+            assert_eq!(
+                iv.len(),
+                IV_LEN,
+                "IV should always be 12 bytes, please file a bug report"
+            );
             let ciphertext = cipher.do_final(env, secret)?;
 
             let iv_len = iv.len() as u8;
 
-            let edit = self.file.edit(env)?;
+            let edit = file.edit(env)?;
             let mut value = vec![iv_len];
             value.extend_from_slice(&iv);
             value.extend_from_slice(&ciphertext);
@@ -169,26 +166,47 @@ impl CredentialApi for AndroidCredential {
 
     fn get_secret(&self) -> keyring_core::Result<Vec<u8>> {
         let r = self.check_for_exception(|env| {
-            let ciphertext = self.file.get_binary(env, &self.user)?;
+            let file = Self::get_file(env, &self.context, &self.service)?;
+            let key = Self::get_key(env, &self.service)?;
+            let ciphertext = file.get_binary(env, &self.user)?;
+
             Ok(match ciphertext {
-                Some(ciphertext) => {
-                    if ciphertext.is_empty() {
-                        return Err(AndroidKeyringError::CorruptedData);
+                Some(data) => {
+                    if data.is_empty() {
+                        return Err(AndroidKeyringError::CorruptedData(
+                            data,
+                            CorruptedData::MissingIvLen,
+                        ));
                     }
 
-                    let iv_len = ciphertext[0] as usize;
-                    let ciphertext = &ciphertext[1..];
-                    if ciphertext.len() < iv_len {
-                        return Err(AndroidKeyringError::CorruptedData);
+                    let iv_len = data[0] as usize;
+
+                    if iv_len != IV_LEN {
+                        return Err(AndroidKeyringError::CorruptedData(
+                            data,
+                            CorruptedData::InvalidIvLen(iv_len),
+                        ));
+                    }
+
+                    let ciphertext = &data[1..];
+                    let ciphertext_len = ciphertext.len();
+                    if ciphertext_len <= iv_len {
+                        return Err(AndroidKeyringError::CorruptedData(
+                            data,
+                            CorruptedData::DataTooSmall(ciphertext_len),
+                        ));
                     }
 
                     let iv = &ciphertext[..iv_len];
+                    let iv = &iv[..iv_len];
                     let ciphertext = &ciphertext[iv_len..];
 
                     let spec = GCMParameterSpec::new(env, 128, iv)?;
                     let cipher = Cipher::get_instance(env, CIPHER_TRANSFORMATION)?;
-                    cipher.init2(env, DECRYPT_MODE, &self.key, spec.into())?;
-                    let plaintext = cipher.do_final(env, ciphertext)?;
+                    cipher.init2(env, DECRYPT_MODE, &key, spec.into())?;
+                    let plaintext = cipher.do_final(env, ciphertext).map_err(move |_| {
+                        AndroidKeyringError::CorruptedData(data, CorruptedData::DecryptionFailure)
+                    })?;
 
                     Some(plaintext)
                 }
@@ -204,8 +222,10 @@ impl CredentialApi for AndroidCredential {
 
     fn delete_credential(&self) -> keyring_core::Result<()> {
         self.check_for_exception(|env| {
-            let edit = self.file.edit(env)?;
+            let file = Self::get_file(env, &self.context, &self.service)?;
+            let edit = file.edit(env)?;
             edit.remove(env, &self.user)?.commit(env)?;
+            edit.commit(env)?;
             Ok(())
         })?;
 
@@ -238,11 +258,10 @@ pub trait HasJavaVm {
         if env.exception_check()? {
             env.exception_describe()?;
             env.exception_clear()?;
-            if let Err(e) = t_result {
-                tracing::warn!(%e, "Result::Err being converted into JavaExceptionThrown");
-                tracing::debug!(?e);
+
+            if t_result.is_ok() {
+                return Err(AndroidKeyringError::JavaExceptionThrow);
             }
-            return Err(AndroidKeyringError::JavaExceptionThrow);
         }
 
         t_result
@@ -265,12 +284,34 @@ pub enum AndroidKeyringError {
     JniError(#[from] jni::errors::Error),
     #[error("Java exception was thrown")]
     JavaExceptionThrow,
-    #[error("Corrupted data in SharedPreferences")]
-    CorruptedData,
+    #[error("{1}")]
+    CorruptedData(Vec<u8>, CorruptedData),
 }
 impl From<AndroidKeyringError> for keyring_core::Error {
     fn from(value: AndroidKeyringError) -> Self {
-        Self::PlatformFailure(Box::new(value))
+        match value {
+            AndroidKeyringError::JniError(error) => {
+                keyring_core::Error::PlatformFailure(Box::new(error))
+            }
+            e @ AndroidKeyringError::JavaExceptionThrow => {
+                keyring_core::Error::PlatformFailure(Box::new(e))
+            }
+            AndroidKeyringError::CorruptedData(data, error) => {
+                keyring_core::Error::BadDataFormat(data, Box::new(error))
+            }
+        }
     }
 }
 type AndroidKeyringResult<T> = Result<T, AndroidKeyringError>;
+
+#[derive(thiserror::Error, Debug)]
+pub enum CorruptedData {
+    #[error("IV length not specified on entry")]
+    MissingIvLen,
+    #[error("IV length in data is {0}, but should be {expected}", expected=IV_LEN)]
+    InvalidIvLen(usize),
+    #[error("Data is too small to contain IV and ciphertext, length = {0}")]
+    DataTooSmall(usize),
+    #[error("Verification of data signature/MAC failed")]
+    DecryptionFailure,
+}
