@@ -136,6 +136,7 @@ impl AndroidCredential {
                 .set_block_modes(env, &[BLOCK_MODE_GCM])?
                 .set_encryption_paddings(env, &[ENCRYPTION_PADDING_NONE])?
                 .set_user_authentication_required(env, false)?
+                .set_unlocked_device_required(env, false)?
                 .build(env)?;
                 let key_generator = KeyGenerator::get_instance(env, KEY_ALGORITHM_AES, PROVIDER)?;
                 key_generator.init(env, key_generator_spec.into())?;

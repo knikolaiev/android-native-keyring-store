@@ -269,6 +269,22 @@ impl KeyGenParameterSpecBuilder {
         ThisMethod::call(&self.self_, env, required)
     }
 
+    pub fn set_unlocked_device_required(
+        &self,
+        env: &mut JNIEnv,
+        required: bool,
+    ) -> JResult<KeyGenParameterSpecBuilder> {
+        struct ThisMethod;
+        impl Method for ThisMethod {
+            type Param = bool;
+            type Return = KeyGenParameterSpecBuilder;
+
+            const NAME: &str = "setUnlockedDeviceRequired";
+        }
+
+        ThisMethod::call(&self.self_, env, required)
+    }
+
     pub fn build(&self, env: &mut JNIEnv) -> JResult<KeyGenParameterSpec> {
         struct ThisMethod;
         impl Method for ThisMethod {
